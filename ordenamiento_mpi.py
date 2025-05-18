@@ -1,112 +1,110 @@
-from mpi4py import MPI
 import pandas as pd
-import numpy as np
-import time
 import os
+import psutil
+from mpi4py import MPI
+import time
 
-# Configuración de MPI
-comm = MPI.COMM_WORLD
-rank = comm.Get_rank()
-size = comm.Get_size()
 
-def merge(left, right):
-    result = []
-    while left and right:
-        # Comparamos por el valor a ordenar (el segundo elemento del par)
-        if left[0][1] <= right[0][1]:
-            result.append(left.pop(0))
-        else:
-            result.append(right.pop(0))
-    # Añadimos los elementos restantes
-    result.extend(left)
-    result.extend(right)
-    return result
+def merge_sort_dataframe(df, column_name, ascending=True):
+    if df.empty:
+        print("El dataframe está vacío. Devolviendo dataframe original")
+        return df
+    if column_name not in df.columns:
+        print(f"Columna '{column_name}' no encontrada en el dataframe. Devolviendo dataframe original")
+        return df
 
-def merge_sort(arr):
-    if len(arr) <= 1:
-        return arr
-    mid = len(arr) // 2
-    left = merge_sort(arr[:mid])
-    right = merge_sort(arr[mid:])
-    return merge(left, right)
+    data_to_sort = list(df.iterrows())
 
-# Maestro
-if rank == 0:
-    # Cargar el dataset
-    dataset_path = "subset.csv"
-    if not os.path.exists(dataset_path):
-        print(f"El archivo '{dataset_path}' no existe.")
-        exit()
+    def merge_sort(data):
+        if len(data) <= 1:
+            return data
 
-    df = pd.read_csv(dataset_path)
+        mid = len(data) // 2
+        left = merge_sort(data[:mid])
+        right = merge_sort(data[mid:])
 
-    # Mostrar columnas disponibles para ordenamiento
-    print("[Maestro] Dataset cargado con", len(df), "registros.")
-    print("[Maestro] Columnas disponibles:", list(df.columns))
+        merged = []
+        left_index, right_index = 0, 0
 
-    # Sugerir cantidad de procesos
-    registros = len(df)
-    if registros < 1000:
-        sugeridos = 2
-    elif registros < 10000:
-        sugeridos = 4
-    elif registros < 100000:
-        sugeridos = 8
+        while left_index < len(left) and right_index < len(right):
+            # Ordenamiento según la dirección especificada
+            if (ascending and left[left_index][1][column_name] <= right[right_index][1][column_name]) or \
+               (not ascending and left[left_index][1][column_name] >= right[right_index][1][column_name]):
+                merged.append(left[left_index])
+                left_index += 1
+            else:
+                merged.append(right[right_index])
+                right_index += 1
+
+        merged.extend(left[left_index:])
+        merged.extend(right[right_index:])
+        return merged
+
+    sorted_data = merge_sort(data_to_sort)
+    sorted_df = pd.DataFrame([item[1] for item in sorted_data])
+    return sorted_df
+
+
+if __name__ == "__main__":
+    comm = MPI.COMM_WORLD
+    size = comm.Get_size()
+    rank = comm.Get_rank()
+
+    if rank == 0:
+        # Ruta al archivo de datos
+        dataset_path = "subset.csv"
+        df = pd.read_csv(dataset_path)
+        num_rows = len(df)
+
+        # Sugerencia de procesospi
+        num_cores = psutil.cpu_count(logical=False)
+        recommended_processes = min(num_cores, num_rows // 1000) 
+        print(f"Sugerencia: Use alrededor de {recommended_processes} procesos para un rendimiento óptimo.")
+        print(f"Número de filas en el dataset: {num_rows}")
     else:
-        sugeridos = 16
-    print(f"[SUGERENCIA] Para {registros} registros, se recomienda usar {sugeridos} procesos.")
+        df = None
+        num_rows = None
 
-    # Solicitar columna y orden de ordenamiento
-    columna = input("Seleccione una columna para ordenar: ")
-    orden = input("Seleccione el orden (ascendente/descendente): ").strip().lower()
-    if orden not in ["ascendente", "descendente"]:
-        print("Orden no válido, usando 'ascendente' por defecto.")
-        orden = "ascendente"
+    num_rows = comm.bcast(num_rows, root=0)
+    chunk_size = num_rows // size
+    remainder = num_rows % size
 
-    # Convertir a lista de tuplas (índice, valor) para ordenamiento
-    datos = list(df[columna].items())
+    if rank == 0:
+        chunks = [df.iloc[i:i + chunk_size + (1 if i < remainder else 0)] for i in range(0, num_rows, chunk_size)]
+    else:
+        chunks = None
 
-    # Dividir los datos en partes para cada proceso
-    partes = np.array_split(datos, size)
-    start_time = time.time()
+    local_df = comm.scatter(chunks, root=0)
 
-else:
-    partes = None
-    columna = None
-    orden = None
+    # Selección de columna y dirección de ordenamiento
+    if rank == 0:
+        try:
+            sort_column = input("Ingrese el nombre de la columna con la que desea ordenar el dataset: ")
+            sort_direction = input("¿Desea ordenar en orden ascendente? (s/n): ").strip().lower()
+            ascending = sort_direction == 's'
+        except Exception as e:
+            print(f"Ocurrió un error: {e}")
+            comm.Abort(1)
+    else:
+        sort_column = None
+        ascending = None
 
-# Compartir columna y orden con todos los procesos
-columna = comm.bcast(columna, root=0)
-orden = comm.bcast(orden, root=0)
+    sort_column = comm.bcast(sort_column, root=0)
+    ascending = comm.bcast(ascending, root=0)
 
-# Distribuir partes del dataset
-parte = comm.scatter(partes, root=0)
+    inicio_local = time.time()
+    local_sorted_df = merge_sort_dataframe(local_df.copy(), sort_column, ascending=ascending)
+    tiempo_local = time.time() - inicio_local
+    print(f"[Proceso {rank}] Tiempo de ordenamiento local: {tiempo_local:.4f} segundos.")
 
-# Ordenar localmente
-inicio_local = time.time()
-parte_ordenada = merge_sort(list(parte))
-tiempo_local = time.time() - inicio_local
-print(f"[Proceso {rank}] Tiempo de ordenamiento local: {tiempo_local:.4f} segundos.")
+    sorted_chunks = comm.gather(local_sorted_df, root=0)
 
-# Recolectar partes ordenadas
-partes_ordenadas = comm.gather(parte_ordenada, root=0)
+    if rank == 0:
+        sorted_df = pd.concat(sorted_chunks)
+        sorted_df = merge_sort_dataframe(sorted_df.copy(), sort_column, ascending=ascending)
 
-# Fusionar los resultados en el maestro
-if rank == 0:
-    # Fusionar todas las partes ordenadas
-    resultado_final = []
-    for parte in partes_ordenadas:
-        resultado_final = merge(resultado_final, parte)
-
-    # Invertir el resultado si el orden es descendente
-    if orden == "descendente":
-        resultado_final.reverse()
-
-    # Extraer los valores para crear el dataframe final
-    df_ordenado = pd.DataFrame({columna: [x[1] for x in resultado_final]})
-
-    # Guardar en archivo CSV
-    output_file = "dataset_ordenado.csv"
-    df_ordenado.to_csv(output_file, index=False)
-    print(f"[Maestro] Ordenamiento global completado en {time.time() - start_time:.4f} segundos.")
-    print(f"[Maestro] Archivo ordenado guardado como '{output_file}'.")
+        file_path = os.path.join(os.getcwd(), "dataset_ordenado.csv")
+        sorted_df.to_csv(file_path, index=False)
+        print(f"El dataset ordenado se guardó en: {file_path}")
+    else:
+        sorted_df = None
